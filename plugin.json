@@ -1,6 +1,6 @@
 {
   "plugin.id": "steam",
-  "plugin.name": "Steam",
+  "plugin.name": "Steam (Aurelia)",
   "plugin.version": "2.0.0",
   "plugin.min-api-version": "2.0.0",
   "plugin.link": "https://github.com/ShadowBlip/OpenGamepadUI-steam",
