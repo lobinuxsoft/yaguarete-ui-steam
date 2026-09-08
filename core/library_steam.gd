@@ -359,11 +359,48 @@ func _app_info_to_launch_item(info: Dictionary, is_installed: bool) -> LibraryLa
 		for genre in data["genres"]:
 			tags.append((genre["description"] as String).to_lower())
 
+	# Launched through Goldberg + umu-run against the REAL Steam-created
+	# wineprefix and its matching Proton build (see _find_real_install),
+	# not Aurelia's own managed --umu prefix — confirmed 2026-09-07 via
+	# Aurelia's own launch summary.json ("per_game_prefix_honored": false)
+	# that --umu ignores any externally set WINEPREFIX, so it can only
+	# ever run in a prefix Steam Cloud has never heard of. Every
+	# real-Steam-client bridge combination (--steam, --umu --steam) was
+	# also retested this same session and failed 4/4 times in 3 distinct
+	# ways — including steamwebhelper itself crash-looping (its own
+	# -startcount arg climbing 0->1->2 unprompted) with FINAL FANTASY VII
+	# REMAKE INTERGRADE, never once reaching the actual game process — so
+	# there is no real-client fallback to reach for here either.
 	var item := LibraryLaunchItem.new()
 	item.provider_app_id = app_id
 	item.name = data["name"]
-	item.command = "steam"
-	item.args = ["-gamepadui", "-steamos3", "-steampal", "-steamdeck", "-silent", "steam://rungameid/" + app_id]
+	var real := _find_real_install(app_id)
+	if real.is_empty():
+		item.command = "/".join([OS.get_environment("HOME"), ".local", "bin", "aurelia"])
+		item.args = ["play", "--umu", app_id, "--json"]
+		# _find_real_install already rejected any real prefix living on a
+		# FUSE mount (Proton's own game-drive symlink can't be created
+		# there — see _supports_wineprefix) and fell through to here, but
+		# a real, populated prefix may still exist at that same rejected
+		# path with actual save files in it that Aurelia's own separate
+		# master prefix has never seen. Bridge just the save folders
+		# across via symlink, not the whole prefix.
+		var real_prefix := _find_any_real_prefix(app_id)
+		if not real_prefix.is_empty():
+			_link_real_saves(app_id, real_prefix)
+	else:
+		item.command = "/usr/bin/umu-run"
+		item.args = [real["exe_path"]]
+		item.cwd = real["install_dir"]
+		item.env = {
+			"GAMEID": app_id,
+			"STORE": "steam",
+			"PROTONPATH": real["proton_path"],
+			"WINEPREFIX": real["wineprefix"],
+			"STEAM_COMPAT_INSTALL_PATH": real["install_dir"],
+			"STEAM_COMPAT_LIBRARY_PATHS": real["library_root"],
+			"UMU_RUNTIME_UPDATE": "0",
+		}
 	item.categories = categories
 	item.tags = ["steam"]
 	item.tags.append_array(tags)
@@ -383,5 +420,235 @@ func _app_supports_linux(app_id: String) -> bool:
 		return false
 	if not "linux" in info[app_id]["data"]["platform"]:
 		return false
-	
+
 	return info[app_id]["data"]["platform"]["linux"]
+
+
+## Resolves a real, already-Steam-created install + wineprefix for the
+## given app id. Checks every registered library's own steamapps dir
+## directly for the manifest — NOT libraryfolders.vdf's own "apps" list,
+## which can go stale (a game moved onto a cartridge after Steam last
+## scanned it still lists the OLD folder there while the manifest and a
+## real, populated wineprefix live on the new one; live-caught 2026-09-07,
+## FINAL FANTASY VII REMAKE INTERGRADE listed under the main library while
+## every actual file was on a cartridge mount). Among every library that
+## has the manifest, the first with a REAL prefix (Tatu's own
+## _is_real_prefix check: system.reg present) wins; a manifest-only match
+## with no real prefix is kept as a fallback in case none do. Returns {}
+## if nothing at all resolves — callers fall back to Aurelia's own --umu,
+## which manages its own prefix instead.
+func _find_real_install(app_id: String) -> Dictionary:
+	if not FileAccess.file_exists(libraryfolders_path):
+		return {}
+	var vdf := VDF.new()
+	if vdf.parse(FileAccess.get_file_as_string(libraryfolders_path)) != OK:
+		return {}
+	var libraryfolders := vdf.get_data()
+	if not "libraryfolders" in libraryfolders:
+		return {}
+	var entries := libraryfolders["libraryfolders"] as Dictionary
+	var fallback := {}
+	for folder in entries.values():
+		if not "path" in folder:
+			continue
+		var library_root := folder["path"] as String
+		var manifest_path := "/".join([library_root, "steamapps", "appmanifest_" + app_id + ".acf"])
+		if not FileAccess.file_exists(manifest_path):
+			continue
+		var manifest_vdf := VDF.new()
+		if manifest_vdf.parse(FileAccess.get_file_as_string(manifest_path)) != OK:
+			continue
+		var manifest := manifest_vdf.get_data()
+		if not "AppState" in manifest or not "installdir" in manifest["AppState"]:
+			continue
+		var install_dir := "/".join([library_root, "steamapps", "common", manifest["AppState"]["installdir"]])
+		var exe_path := _find_main_exe(install_dir)
+		if exe_path == "":
+			continue
+		var compatdata := "/".join([library_root, "steamapps", "compatdata", app_id])
+		var version_path := "/".join([compatdata, "version"])
+		if not FileAccess.file_exists(version_path):
+			continue
+		var proton_name := FileAccess.get_file_as_string(version_path).strip_edges()
+		var proton_path := _find_proton_path(proton_name)
+		if proton_path == "":
+			continue
+		var wineprefix := "/".join([compatdata, "pfx"])
+		if not _supports_wineprefix(wineprefix):
+			continue
+		var candidate := {
+			"install_dir": install_dir,
+			"exe_path": exe_path,
+			"wineprefix": wineprefix,
+			"proton_path": proton_path,
+			"library_root": library_root,
+		}
+		if FileAccess.file_exists("/".join([wineprefix, "system.reg"])):
+			return candidate
+		if fallback.is_empty():
+			fallback = candidate
+	return fallback
+
+
+## Same manifest walk as _find_real_install, but without the
+## _supports_wineprefix filter — used only to locate save files to bridge
+## across, never to pick a WINEPREFIX to actually launch with.
+func _find_any_real_prefix(app_id: String) -> String:
+	if not FileAccess.file_exists(libraryfolders_path):
+		return ""
+	var vdf := VDF.new()
+	if vdf.parse(FileAccess.get_file_as_string(libraryfolders_path)) != OK:
+		return ""
+	var libraryfolders := vdf.get_data()
+	if not "libraryfolders" in libraryfolders:
+		return ""
+	for folder in (libraryfolders["libraryfolders"] as Dictionary).values():
+		if not "path" in folder:
+			continue
+		var compatdata := "/".join([folder["path"], "steamapps", "compatdata", app_id])
+		var wineprefix := "/".join([compatdata, "pfx"])
+		if FileAccess.file_exists("/".join([wineprefix, "system.reg"])):
+			return wineprefix
+	return ""
+
+
+## Symlinks every real save folder this account's Steam Cloud already
+## knows about (Aurelia's own cloud_sync cache — the same real paths, not
+## a guessed per-game folder name) from wherever a real prefix actually
+## has them into Aurelia's single shared --umu prefix, so a standalone
+## launch through it sees the same saves a real prefix launch would.
+## Idempotent and additive only: never touches a destination that isn't
+## itself already one of our own symlinks, so a save a standalone launch
+## has genuinely written on its own is never clobbered.
+func _link_real_saves(app_id: String, real_prefix: String) -> void:
+	var home := OS.get_environment("HOME")
+	var cloud_sync_path := "/".join([home, ".config/Aurelia/cloud_sync", app_id + ".json"])
+	if not FileAccess.file_exists(cloud_sync_path):
+		return
+	var parsed = JSON.parse_string(FileAccess.get_file_as_string(cloud_sync_path))
+	if not parsed is Dictionary or not "files" in parsed:
+		return
+	var master_prefix := "/".join([home, ".config/Aurelia/master_steam_prefix/pfx/pfx"])
+	var linked_rel_dirs := {}
+	for key in (parsed["files"] as Dictionary).keys():
+		var rel_key := (key as String)
+		if not rel_key.begins_with("%WinMyDocuments%"):
+			continue
+		var rel_dir := rel_key.trim_prefix("%WinMyDocuments%").get_base_dir()
+		if rel_dir in linked_rel_dirs:
+			continue
+		linked_rel_dirs[rel_dir] = true
+		var dest := "/".join([master_prefix, "drive_c/users/steamuser/Documents", rel_dir])
+		# Anything already here — a real directory from a prior standalone
+		# save, or a symlink this same function made on an earlier launch —
+		# is left alone. Only ever fills in a destination that doesn't
+		# exist yet at all.
+		if DirAccess.dir_exists_absolute(dest):
+			continue
+		for source in [
+			"/".join([real_prefix, "drive_c/users/steamuser/documents", rel_dir.to_lower()]),
+			"/".join([real_prefix, "drive_c/users/steamuser/Documents", rel_dir]),
+		]:
+			if not DirAccess.dir_exists_absolute(source):
+				continue
+			DirAccess.make_dir_recursive_absolute(dest.get_base_dir())
+			OS.execute("ln", ["-s", source, dest])
+			break
+
+
+## FUSE-mounted NTFS/exFAT (the norm for external cartridges/USB storage)
+## doesn't support real POSIX symlinks, and Proton's own game-drive setup
+## (the "S:" dosdevice, done on every session init, not just the first)
+## needs exactly that — live-caught 2026-09-07, FINAL FANTASY VII REMAKE:
+## os.symlink() failed with EINVAL trying to create pfx/dosdevices/s: on a
+## fuseblk mount. Matches Tatu's own goldberg.rs, which explicitly never
+## reuses a real prefix living on the cartridge itself for the same reason
+## (_find_real_prefix skips it, always falling back to a fresh prefix on
+## internal storage instead).
+func _supports_wineprefix(path: String) -> bool:
+	var f := FileAccess.open("/proc/mounts", FileAccess.READ)
+	if not f:
+		return true
+	var best_mount_point := ""
+	var best_fstype := ""
+	while not f.eof_reached():
+		var fields := f.get_line().split(" ")
+		if fields.size() < 3:
+			continue
+		var mount_point: String = fields[1]
+		if path.begins_with(mount_point) and mount_point.length() > best_mount_point.length():
+			best_mount_point = mount_point
+			best_fstype = fields[2]
+	return not best_fstype.to_lower() in ["fuseblk", "ntfs", "ntfs3", "exfat", "fuse.ntfs-3g", "fuse.exfat"]
+
+
+## Picks the main .exe for an install directory. No appinfo.vdf lookup
+## (Steam's own binary VDF cache — a separate format vdf.gd doesn't parse)
+## — just the install root's own .exe if there's exactly one, or the
+## shallowest non-redistributable .exe within a few directories of it.
+## Covers the common case (single root-level exe, or a UE-style
+## Binaries/Win64 layout); games Steam itself resolves a different way for
+## "Play" need appinfo.vdf support added here later.
+func _find_main_exe(install_dir: String) -> String:
+	var root_exes := _list_exes(install_dir)
+	if root_exes.size() == 1:
+		return root_exes[0]
+	var non_game_needles := [
+		"vcredist", "vc_redist", "directx", "dxsetup", "redist",
+		"crashpad", "crashhandler", "easyanticheat", "uninstall", "setup.exe",
+	]
+	for candidate in _walk_exes(install_dir, 0, 5):
+		var lower := candidate.get_file().to_lower()
+		var is_redist := false
+		for needle in non_game_needles:
+			if needle in lower:
+				is_redist = true
+				break
+		if not is_redist:
+			return candidate
+	return ""
+
+
+func _list_exes(dir_path: String) -> PackedStringArray:
+	var result := PackedStringArray()
+	var dir := DirAccess.open(dir_path)
+	if not dir:
+		return result
+	dir.list_dir_begin()
+	var file_name := dir.get_next()
+	while file_name != "":
+		if not dir.current_is_dir() and file_name.get_extension().to_lower() == "exe":
+			result.append("/".join([dir_path, file_name]))
+		file_name = dir.get_next()
+	dir.list_dir_end()
+	return result
+
+
+func _walk_exes(dir_path: String, depth: int, max_depth: int) -> PackedStringArray:
+	var result := _list_exes(dir_path)
+	if depth >= max_depth:
+		return result
+	var dir := DirAccess.open(dir_path)
+	if not dir:
+		return result
+	dir.list_dir_begin()
+	var file_name := dir.get_next()
+	while file_name != "":
+		if dir.current_is_dir() and not file_name.begins_with("."):
+			result.append_array(_walk_exes("/".join([dir_path, file_name]), depth + 1, max_depth))
+		file_name = dir.get_next()
+	dir.list_dir_end()
+	return result
+
+
+func _find_proton_path(proton_name: String) -> String:
+	var home := OS.get_environment("HOME")
+	var candidates := [
+		"/".join([home, ".steam/root/compatibilitytools.d", proton_name]),
+		"/".join([home, ".local/share/Steam/compatibilitytools.d", proton_name]),
+		"/".join([home, ".local/share/Steam/steamapps/common", proton_name]),
+	]
+	for candidate in candidates:
+		if DirAccess.dir_exists_absolute(candidate):
+			return candidate
+	return ""

@@ -1,5 +1,7 @@
-PLUGIN_ID ?= $(shell grep 'plugin\.id' plugin.json | awk '{print $$2}' | grep -o '"[^"]\+"' | sed 's/"//g')
-PLUGIN_NAME ?= $(shell grep 'plugin\.name' plugin.json | awk '{print $$2}' | grep -o '"[^"]\+"' | sed 's/"//g')
+# jq, not awk+grep — the old one-word assumption broke silently (empty
+# PLUGIN_NAME, --export-pack "") the moment the display name grew a space.
+PLUGIN_ID ?= $(shell jq -r '."plugin.id"' plugin.json)
+PLUGIN_NAME ?= $(shell jq -r '."plugin.name"' plugin.json)
 
 GODOT ?= /usr/bin/godot
 OPENGAMEPAD_UI_REPO ?= https://github.com/ShadowBlip/OpenGamepadUI.git
